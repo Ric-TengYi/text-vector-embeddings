@@ -5,6 +5,7 @@ import { customOctokit as Octokit } from "@ubiquity-os/plugin-sdk/octokit";
 import { Logs } from "@ubiquity-os/ubiquity-os-logger";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import dotenv from "dotenv";
+import { RestEndpointMethodTypes } from "@octokit/plugin-rest-endpoint-methods";
 import { IssueSimilaritySearchResult } from "../src/adapters/supabase/helpers/issues";
 import { IssueGraphqlResponse } from "../src/handlers/issue-matching";
 import { Context } from "../src/types/context";
@@ -21,6 +22,13 @@ const DEFAULT_HOOK = "issue_comment.created";
 const DEFAULT_ISSUE_ID = "1";
 const DEFAULT_BODY = "Test issue body";
 const ISSUES_EDITED_EVENT_NAME = "issues.edited";
+const ISSUE_AUTHOR_LOGIN = "test";
+const BOT_CONTRIBUTOR_LOGIN = "github-actions[bot]";
+const TOP_CODE_CONTRIBUTOR_LOGIN = "top-code-contributor";
+const SECOND_CODE_CONTRIBUTOR_LOGIN = "second-code-contributor";
+const EMPTY_TOP_CODE_CONTRIBUTOR_LOGIN = "empty-top-code-contributor";
+const EMPTY_SECOND_CODE_CONTRIBUTOR_LOGIN = "empty-second-code-contributor";
+type ListContributorsResponse = RestEndpointMethodTypes["repos"]["listContributors"]["response"];
 
 dotenv.config();
 const octokit = new Octokit();
@@ -46,6 +54,15 @@ describe("Plugin tests", () => {
       isPluginEdit: mock(() => true),
     }));
   });
+
+  function mockRepositoryContributors(context: Context, contributors: ListContributorsResponse["data"] = []) {
+    context.octokit.rest.repos.listContributors = mock(async () => ({
+      data: contributors,
+      status: 200,
+      url: "",
+      headers: {},
+    })) as unknown as typeof context.octokit.rest.repos.listContributors;
+  }
 
   it("When a comment is created it should add it to the database", async () => {
     const { context } = createContext(STRINGS.HELLO_WORLD, 1, 1, 1, "sasasCreate");
@@ -388,9 +405,9 @@ describe("Plugin tests", () => {
     context.eventName = ISSUES_EDITED_EVENT_NAME;
 
     context.adapters.supabase.issue.findSimilarIssuesToMatch = mock().mockResolvedValue([
-      { issue_id: "same-repo", similarity: 0.6 },
-      { issue_id: "same-org", similarity: 0.7 },
-      { issue_id: "global", similarity: 0.9 },
+      { issue_id: "same-repo", similarity: 0.7 },
+      { issue_id: "same-org", similarity: 0.8 },
+      { issue_id: "global", similarity: 0.92 },
     ] as IssueSimilaritySearchResult[]);
     const globalContributor = "global-contributor";
     const sameOrgContributor = "same-org-contributor";
@@ -438,9 +455,9 @@ describe("Plugin tests", () => {
 
     const comments = db.issueComments.findMany({ where: { node_id: { equals: "weighted_match" } } });
     expect(comments.length).toBe(1);
+    expect(comments[0].body).toContain("70% Match");
     expect(comments[0].body).toContain("60% Match");
-    expect(comments[0].body).toContain("52% Match");
-    expect(comments[0].body).toContain("45% Match");
+    expect(comments[0].body).toContain("46% Match");
     expect(comments[0].body.indexOf("same-repo-contributor")).toBeLessThan(comments[0].body.indexOf(sameOrgContributor));
     expect(comments[0].body.indexOf(sameOrgContributor)).toBeLessThan(comments[0].body.indexOf(globalContributor));
   });
@@ -466,12 +483,12 @@ describe("Plugin tests", () => {
       },
     }) as unknown as typeof context.octokit.graphql;
 
-    context.octokit.rest.repos.listContributors = mock(async () => ({
-      data: [
-        { login: "top-code-contributor", contributions: 42 },
-        { login: "second-code-contributor", contributions: 15 },
-      ],
-    })) as unknown as typeof context.octokit.rest.repos.listContributors;
+    mockRepositoryContributors(context, [
+      { login: SECOND_CODE_CONTRIBUTOR_LOGIN, contributions: 15 },
+      { login: BOT_CONTRIBUTOR_LOGIN, contributions: 200 },
+      { login: ISSUE_AUTHOR_LOGIN, contributions: 100 },
+      { login: TOP_CODE_CONTRIBUTOR_LOGIN, contributions: 42 },
+    ] as ListContributorsResponse["data"]);
 
     context.octokit.rest.issues.createComment = mock(async (params: { owner: string; repo: string; issue_number: number; body: string }) => {
       createComment(params.body, 5, "low_confidence_match", params.issue_number);
@@ -481,10 +498,40 @@ describe("Plugin tests", () => {
 
     const comments = db.issueComments.findMany({ where: { node_id: { equals: "low_confidence_match" } } });
     expect(comments.length).toBe(1);
-    expect(comments[0].body).toContain("top-code-contributor");
+    expect(comments[0].body).toContain(TOP_CODE_CONTRIBUTOR_LOGIN);
+    expect(comments[0].body.indexOf(TOP_CODE_CONTRIBUTOR_LOGIN)).toBeLessThan(comments[0].body.indexOf(SECOND_CODE_CONTRIBUTOR_LOGIN));
     expect(comments[0].body).toContain("Repository contributor fallback");
     expect(comments[0].body).toContain("42 commits");
     expect(comments[0].body).not.toContain("low-score-contributor");
+    expect(comments[0].body).not.toContain(BOT_CONTRIBUTOR_LOGIN);
+    expect(comments[0].body).not.toContain(`https://www.github.com/${ISSUE_AUTHOR_LOGIN}`);
+  });
+
+  it("When no issue matches are found, it should recommend repository code contributors", async () => {
+    const [taskCompleteIssue] = fetchSimilarIssues("task_complete");
+    const { context } = createContextIssues(taskCompleteIssue.issue_body, "empty_match_fallback", 14, taskCompleteIssue.title);
+    context.eventName = ISSUES_EDITED_EVENT_NAME;
+
+    context.adapters.supabase.issue.findSimilarIssuesToMatch = mock().mockResolvedValue([] as IssueSimilaritySearchResult[]);
+    mockRepositoryContributors(context, [
+      { login: EMPTY_SECOND_CODE_CONTRIBUTOR_LOGIN, contributions: 15 },
+      { login: BOT_CONTRIBUTOR_LOGIN, contributions: 200 },
+      { login: ISSUE_AUTHOR_LOGIN, contributions: 100 },
+      { login: EMPTY_TOP_CODE_CONTRIBUTOR_LOGIN, contributions: 42 },
+    ] as ListContributorsResponse["data"]);
+
+    context.octokit.rest.issues.createComment = mock(async (params: { owner: string; repo: string; issue_number: number; body: string }) => {
+      createComment(params.body, 6, "empty_match_fallback", params.issue_number);
+    }) as unknown as typeof octokit.rest.issues.createComment;
+
+    await runPlugin(context);
+
+    const comments = db.issueComments.findMany({ where: { node_id: { equals: "empty_match_fallback" } } });
+    expect(comments.length).toBe(1);
+    expect(comments[0].body).toContain(EMPTY_TOP_CODE_CONTRIBUTOR_LOGIN);
+    expect(comments[0].body.indexOf(EMPTY_TOP_CODE_CONTRIBUTOR_LOGIN)).toBeLessThan(comments[0].body.indexOf(EMPTY_SECOND_CODE_CONTRIBUTOR_LOGIN));
+    expect(comments[0].body).not.toContain(BOT_CONTRIBUTOR_LOGIN);
+    expect(comments[0].body).not.toContain(`https://www.github.com/${ISSUE_AUTHOR_LOGIN}`);
   });
 
   it("When an issue contains markdown links, footnotes should be added after the entire line", async () => {
@@ -636,6 +683,7 @@ describe("Plugin tests", () => {
 
   it("When demoFlag is true, it should skip storing issues in the database", async () => {
     const { context } = createContextIssues(DEFAULT_BODY, "demoIssue", 10, "Demo Test Issue");
+    mockRepositoryContributors(context);
 
     // Enable demo mode
     context.config = {
@@ -666,6 +714,7 @@ describe("Plugin tests", () => {
 
   it("When demoFlag is false (default), it should store issues in the database", async () => {
     const { context } = createContextIssues(DEFAULT_BODY, "normalIssue", 11, "Normal Test Issue");
+    mockRepositoryContributors(context);
     context.config.demoFlag = false;
     await runPlugin(context);
 
@@ -688,6 +737,7 @@ describe("Plugin tests", () => {
   it("When a user uses annotate command with a specified comment and 'repo' scope and the comment doesn't have similarity above match threshold with any issue from the same repository, it shouldn't update comment body with footnotes", async () => {
     const [annotateIssue] = fetchSimilarIssues("annotate");
     const { context } = createContextIssues(annotateIssue.issue_body, "annotate", 9, annotateIssue.title);
+    mockRepositoryContributors(context);
     context.adapters.supabase.issue.findSimilarIssues = mock().mockResolvedValue([]);
     context.adapters.supabase.comment.findSimilarComments = mock().mockResolvedValue([]);
     context.adapters.supabase.issue.createIssue = mock(async () => {
